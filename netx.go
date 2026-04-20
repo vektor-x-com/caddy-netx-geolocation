@@ -165,8 +165,8 @@ func (n *NetxGeolocation) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 		repl.Set("netx_geo.org_name", record.OrgName)
 		repl.Set("netx_geo.org_id", record.OrgID)
 	} else {
-		repl.Set("netx_geo.country", "UNK")
-		repl.Set("netx_geo.registry", "UNK")
+		repl.Set("netx_geo.country", "-")
+		repl.Set("netx_geo.registry", "-")
 		repl.Set("netx_geo.org_name", "")
 		repl.Set("netx_geo.org_id", "")
 	}
@@ -265,7 +265,7 @@ func (n *NetxGeolocation) matchesFilters(record *geoRecord) bool {
 // Deny takes precedence over allow.
 func checkAllowed(item string, allow, deny []string) bool {
 	if item == "" {
-		item = "UNK"
+		item = "-"
 	}
 	upperItem := strings.ToUpper(item)
 

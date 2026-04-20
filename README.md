@@ -84,7 +84,7 @@ Available for use in other directives after `netx_geolocation` runs:
 | `{netx_geo.org_name}` | Organization name |
 | `{netx_geo.org_id}` | Organization ID |
 
-If an IP is not found in the database, `country` and `registry` are set to `UNK`.
+If an IP is not found in the database, `country` and `registry` are set to `-`.
 
 ## Usage Examples
 
@@ -213,7 +213,7 @@ The database contains ~572,000 IP range entries covering ~70,000 organizations.
 ## Resilience
 
 - If the API is unreachable during daily refresh, existing data is preserved
-- If the API is unreachable on first startup and no local file exists, the plugin starts with empty data (all lookups return `UNK`, no blocking occurs)
+- If the API is unreachable on first startup and no local file exists, the plugin starts with empty data (all lookups return `-`, no blocking occurs)
 - Data file writes are atomic (temp file + rename) to prevent corruption
 - Malformed CIDR entries from the API are skipped without affecting other entries
 

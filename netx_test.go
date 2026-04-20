@@ -18,7 +18,7 @@ func TestCheckAllowed(t *testing.T) {
 		{"denied", "CN", nil, []string{"CN", "RU"}, false},
 		{"not denied", "US", nil, []string{"CN", "RU"}, true},
 		{"deny takes precedence", "US", []string{"US"}, []string{"US"}, false},
-		{"empty item becomes UNK", "", []string{"UNK"}, nil, true},
+		{"empty item becomes -", "", []string{"-"}, nil, true},
 		{"case insensitive", "us", []string{"US"}, nil, true},
 	}
 
