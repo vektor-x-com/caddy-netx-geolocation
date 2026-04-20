@@ -1,0 +1,19 @@
+{
+	order netx_geolocation before respond
+	auto_https off
+	admin off
+	servers {
+		trusted_proxies static 127.0.0.1 ::1
+	}
+}
+
+:8080 {
+	netx_geolocation {
+		api_url https://net.vektor-x.com
+		data_dir /tmp/caddy-netx-test
+		refresh_time 03:00
+		deny_countries RU CN
+	}
+
+	respond "IP={http.request.remote.host} Country={netx_geo.country} Registry={netx_geo.registry} Org={netx_geo.org_name} OrgID={netx_geo.org_id}" 200
+}
