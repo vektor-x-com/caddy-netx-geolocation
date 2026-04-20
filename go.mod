@@ -1,4 +1,4 @@
-module github.com/whitebyte/caddy-netx-geolocation
+module github.com/vektor-x-com/caddy-netx-geolocation
 
 go 1.22
 
