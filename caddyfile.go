@@ -7,6 +7,7 @@ import (
 
 func init() {
 	httpcaddyfile.RegisterHandlerDirective("netx_geolocation", parseCaddyfileHandler)
+	httpcaddyfile.RegisterDirectiveOrder("netx_geolocation", httpcaddyfile.Before, "header")
 }
 
 func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
