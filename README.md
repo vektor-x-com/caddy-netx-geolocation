@@ -17,7 +17,20 @@ Unlike traditional geolocation plugins that query external APIs on every request
 Build Caddy with the plugin using [xcaddy](https://github.com/caddyserver/xcaddy):
 
 ```bash
-xcaddy build --with github.com/whitebyte/caddy-netx-geolocation
+xcaddy build --with github.com/vektor-x-com/caddy-netx-geolocation
+```
+
+### Docker
+
+```dockerfile
+FROM caddy:builder AS builder
+
+RUN xcaddy build \
+    --with github.com/vektor-x-com/caddy-netx-geolocation
+
+FROM caddy:latest
+
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 ```
 
 ## Configuration
@@ -25,10 +38,6 @@ xcaddy build --with github.com/whitebyte/caddy-netx-geolocation
 ### Caddyfile
 
 ```caddyfile
-{
-    order netx_geolocation before respond
-}
-
 example.com {
     netx_geolocation {
         # API base URL (optional, default: https://net.vektor-x.com)
@@ -91,10 +100,6 @@ If an IP is not found in the database, `country` and `registry` are set to `-`.
 ### Block traffic from specific countries
 
 ```caddyfile
-{
-    order netx_geolocation before respond
-}
-
 example.com {
     netx_geolocation {
         deny_countries RU CN KP
@@ -122,15 +127,17 @@ example.com {
 example.com {
     netx_geolocation
 
-    header_up X-Geo-Country {netx_geo.country}
-    header_up X-Geo-Registry {netx_geo.registry}
-    header_up X-Geo-Org {netx_geo.org_name}
-
-    reverse_proxy localhost:8080
+    reverse_proxy localhost:8080 {
+        header_up X-Geo-Country {netx_geo.country}
+        header_up X-Geo-Registry {netx_geo.registry}
+        header_up X-Geo-Org {netx_geo.org_name}
+    }
 }
 ```
 
 ### Log visitor geolocation
+
+Use `header_up` to attach geolocation data as request headers, which Caddy then includes in structured access logs:
 
 ```caddyfile
 example.com {
@@ -138,15 +145,13 @@ example.com {
 
     log {
         output file /var/log/caddy/access.log
-        format json {
-            fields {
-                geo_country {netx_geo.country}
-                geo_org {netx_geo.org_name}
-            }
-        }
+        format json
     }
 
-    file_server
+    reverse_proxy localhost:8080 {
+        header_up X-Geo-Country {netx_geo.country}
+        header_up X-Geo-Org {netx_geo.org_name}
+    }
 }
 ```
 
@@ -179,6 +184,54 @@ example.com {
     reverse_proxy localhost:3000
 }
 ```
+
+### Behind Cloudflare with fallback
+
+When running behind Cloudflare, configure trusted proxies to get the real client IP, and use a `map` fallback to Cloudflare's `Cf-Ipcountry` header when the NET-X database doesn't have the IP:
+
+```caddyfile
+{
+    servers {
+        trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+        client_ip_headers Cf-Connecting-Ip
+    }
+}
+
+example.com {
+    netx_geolocation
+
+    map {netx_geo.country} {final_country} {
+        "-" {http.request.header.Cf-Ipcountry}
+        default {netx_geo.country}
+    }
+
+    reverse_proxy localhost:8080 {
+        header_up Client-IP {client_ip}
+        header_up Client-Country {final_country}
+    }
+}
+```
+
+### Data enrichment (no blocking)
+
+Use the plugin purely to forward geolocation data to your backend without any deny/allow rules:
+
+```caddyfile
+example.com {
+    netx_geolocation
+
+    reverse_proxy localhost:8080 {
+        header_up -Client-IP
+        header_up -Client-Country
+        header_up Client-IP {client_ip}
+        header_up Client-Country {netx_geo.country}
+        header_up Client-Org {netx_geo.org_name}
+        header_up Client-Registry {netx_geo.registry}
+    }
+}
+```
+
+Your backend receives `Client-IP`, `Client-Country`, `Client-Org`, and `Client-Registry` headers on every request.
 
 ### Use placeholders in responses
 
