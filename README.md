@@ -95,17 +95,46 @@ Available for use in other directives after `netx_geolocation` runs:
 
 If an IP is not found in the database, `country` and `registry` are set to `-`.
 
+## Directive Ordering
+
+Since this is a third-party plugin, Caddy does not know where to place it in the default directive execution order. If `netx_geolocation` doesn't run before directives that use its placeholders, they will remain as unresolved literal text.
+
+**Use a `route` block** to enforce explicit execution order:
+
+```caddyfile
+example.com {
+    route {
+        netx_geolocation
+        reverse_proxy localhost:8080 {
+            header_up X-Geo-Country {netx_geo.country}
+        }
+    }
+}
+```
+
+Alternatively, add an `order` directive in the global options:
+
+```caddyfile
+{
+    order netx_geolocation before reverse_proxy
+}
+```
+
+> **Note:** When using deny/allow rules (e.g. `deny_countries`), the plugin blocks requests directly as a handler, so ordering is less critical. But when using placeholders like `{netx_geo.country}` in other directives, a `route` block is required to guarantee the plugin runs first.
+
 ## Usage Examples
 
 ### Block traffic from specific countries
 
 ```caddyfile
 example.com {
-    netx_geolocation {
-        deny_countries RU CN KP
-    }
+    route {
+        netx_geolocation {
+            deny_countries RU CN KP
+        }
 
-    reverse_proxy localhost:3000
+        reverse_proxy localhost:3000
+    }
 }
 ```
 
@@ -113,11 +142,13 @@ example.com {
 
 ```caddyfile
 example.com {
-    netx_geolocation {
-        allow_countries US CA GB DE FR
-    }
+    route {
+        netx_geolocation {
+            allow_countries US CA GB DE FR
+        }
 
-    file_server
+        file_server
+    }
 }
 ```
 
@@ -125,12 +156,14 @@ example.com {
 
 ```caddyfile
 example.com {
-    netx_geolocation
+    route {
+        netx_geolocation
 
-    reverse_proxy localhost:8080 {
-        header_up X-Geo-Country {netx_geo.country}
-        header_up X-Geo-Registry {netx_geo.registry}
-        header_up X-Geo-Org {netx_geo.org_name}
+        reverse_proxy localhost:8080 {
+            header_up X-Geo-Country {netx_geo.country}
+            header_up X-Geo-Registry {netx_geo.registry}
+            header_up X-Geo-Org {netx_geo.org_name}
+        }
     }
 }
 ```
@@ -141,16 +174,18 @@ Use `header_up` to attach geolocation data as request headers, which Caddy then 
 
 ```caddyfile
 example.com {
-    netx_geolocation
-
     log {
         output file /var/log/caddy/access.log
         format json
     }
 
-    reverse_proxy localhost:8080 {
-        header_up X-Geo-Country {netx_geo.country}
-        header_up X-Geo-Org {netx_geo.org_name}
+    route {
+        netx_geolocation
+
+        reverse_proxy localhost:8080 {
+            header_up X-Geo-Country {netx_geo.country}
+            header_up X-Geo-Org {netx_geo.org_name}
+        }
     }
 }
 ```
@@ -159,11 +194,13 @@ example.com {
 
 ```caddyfile
 example.com {
-    netx_geolocation {
-        deny_orgs "Known Spam Network" "Botnet Hosting LLC"
-    }
+    route {
+        netx_geolocation {
+            deny_orgs "Known Spam Network" "Botnet Hosting LLC"
+        }
 
-    reverse_proxy localhost:3000
+        reverse_proxy localhost:3000
+    }
 }
 ```
 
@@ -175,13 +212,15 @@ example.com {
     @blocked_ips remote_ip 1.2.3.4 5.6.7.0/24
     respond @blocked_ips 403
 
-    # Block by geolocation (this plugin)
-    netx_geolocation {
-        deny_countries CN RU
-        deny_registries afrinic
-    }
+    route {
+        # Block by geolocation (this plugin)
+        netx_geolocation {
+            deny_countries CN RU
+            deny_registries afrinic
+        }
 
-    reverse_proxy localhost:3000
+        reverse_proxy localhost:3000
+    }
 }
 ```
 
@@ -198,16 +237,18 @@ When running behind Cloudflare, configure trusted proxies to get the real client
 }
 
 example.com {
-    netx_geolocation
-
     map {netx_geo.country} {final_country} {
         "-" {http.request.header.Cf-Ipcountry}
         default {netx_geo.country}
     }
 
-    reverse_proxy localhost:8080 {
-        header_up Client-IP {client_ip}
-        header_up Client-Country {final_country}
+    route {
+        netx_geolocation
+
+        reverse_proxy localhost:8080 {
+            header_up Client-IP {client_ip}
+            header_up Client-Country {final_country}
+        }
     }
 }
 ```
@@ -218,15 +259,17 @@ Use the plugin purely to forward geolocation data to your backend without any de
 
 ```caddyfile
 example.com {
-    netx_geolocation
+    route {
+        netx_geolocation
 
-    reverse_proxy localhost:8080 {
-        header_up -Client-IP
-        header_up -Client-Country
-        header_up Client-IP {client_ip}
-        header_up Client-Country {netx_geo.country}
-        header_up Client-Org {netx_geo.org_name}
-        header_up Client-Registry {netx_geo.registry}
+        reverse_proxy localhost:8080 {
+            header_up -Client-IP
+            header_up -Client-Country
+            header_up Client-IP {client_ip}
+            header_up Client-Country {netx_geo.country}
+            header_up Client-Org {netx_geo.org_name}
+            header_up Client-Registry {netx_geo.registry}
+        }
     }
 }
 ```
@@ -237,9 +280,11 @@ Your backend receives `Client-IP`, `Client-Country`, `Client-Org`, and `Client-R
 
 ```caddyfile
 example.com {
-    netx_geolocation
+    route {
+        netx_geolocation
 
-    respond "Your country: {netx_geo.country}, Registry: {netx_geo.registry}, Org: {netx_geo.org_name}" 200
+        respond "Your country: {netx_geo.country}, Registry: {netx_geo.registry}, Org: {netx_geo.org_name}" 200
+    }
 }
 ```
 
