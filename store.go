@@ -127,10 +127,49 @@ func (ds *dataStore) SaveToFile() error {
 		return fmt.Errorf("encoding entries: %w", err)
 	}
 
-	// Write atomically via temp file + rename
-	tmpPath := ds.filePath + ".tmp"
-	if err := os.WriteFile(tmpPath, buf.Bytes(), 0644); err != nil {
+	// Write atomically via temp file + rename.
+	//
+	// The temp name is unique per call rather than a fixed "<file>.tmp". Caddy
+	// provisions a handler once per place it appears in a config, and two
+	// instances pointed at the same data_dir shared that one path: both wrote
+	// it, the first rename consumed it, and the second failed with ENOENT
+	// ("renaming temp file: ... no such file or directory"). A unique name per
+	// write makes concurrent savers independent — each renames its own file,
+	// and whichever lands last wins with a complete copy.
+	//
+	// CreateTemp also creates in the destination directory, which keeps the
+	// rename on one filesystem and therefore atomic.
+	tmp, err := os.CreateTemp(dir, filepath.Base(ds.filePath)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	// From here every failure path removes the temp file; a partially written
+	// one must never be left behind for a later run to trip over.
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("writing temp file: %w", err)
+	}
+	// Sync before the rename so a crash cannot leave the destination pointing
+	// at a file whose contents never reached disk. Without it the rename can be
+	// durable while the data is not, which surfaces as an unreadable cache on
+	// the next boot rather than a missing one.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("syncing temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+	// CreateTemp makes the file 0600; the cache is world-readable like the
+	// previous WriteFile(0644) left it.
+	if err := os.Chmod(tmpPath, 0644); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("setting temp file mode: %w", err)
 	}
 	if err := os.Rename(tmpPath, ds.filePath); err != nil {
 		os.Remove(tmpPath)
