@@ -2,7 +2,7 @@ package caddy_netx_geolocation
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -51,15 +51,22 @@ func TestParseTime(t *testing.T) {
 	}
 }
 
-func TestSchedulerDurationUntilNext(t *testing.T) {
+// testScheduler builds a scheduler through newScheduler rather than as a struct
+// literal: the struct carries an internal context that Stop cancels and
+// doRefresh reads, so a hand-built one would refresh against a nil context.
+func testScheduler(t *testing.T, url string, store *dataStore) *refreshScheduler {
+	t.Helper()
 	logger, _ := zap.NewDevelopment()
-	store := newDataStore("/dev/null")
-	f := newFetcher("http://localhost", logger)
-
-	sched, err := newScheduler("03:00", f, store, logger)
+	sched, err := newScheduler("03:00", newFetcher(url, nil, nil, logger), store, logger)
 	if err != nil {
 		t.Fatalf("newScheduler failed: %v", err)
 	}
+	t.Cleanup(sched.Stop)
+	return sched
+}
+
+func TestSchedulerDurationUntilNext(t *testing.T) {
+	sched := testScheduler(t, "http://localhost", newDataStore("/dev/null"))
 
 	dur := sched.durationUntilNext()
 	if dur <= 0 || dur > 24*time.Hour {
@@ -68,26 +75,18 @@ func TestSchedulerDurationUntilNext(t *testing.T) {
 }
 
 func TestSchedulerStopBeforeFire(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	store := newDataStore("/dev/null")
-	f := newFetcher("http://localhost", logger)
-
-	// Set refresh far in the future so it won't fire
-	sched, err := newScheduler("03:00", f, store, logger)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sched := testScheduler(t, "http://localhost", newDataStore("/dev/null"))
 
 	sched.Start()
 	time.Sleep(10 * time.Millisecond)
 	sched.Stop()
-	// Should not hang or panic
+	// Should not hang or panic. Stop is idempotent enough for the t.Cleanup
+	// call that follows: cancel is safe to repeat and Wait returns immediately.
 }
 
 func TestSchedulerRefreshOnAPIFailure(t *testing.T) {
 	var requestCount atomic.Int32
 
-	// API that always fails
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount.Add(1)
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -95,33 +94,17 @@ func TestSchedulerRefreshOnAPIFailure(t *testing.T) {
 	}))
 	defer server.Close()
 
-	logger, _ := zap.NewDevelopment()
 	store := newDataStore(t.TempDir() + "/test.gob")
-	f := newFetcher(server.URL, logger)
-
-	// Pre-load some data
 	store.Replace([]cidrEntry{
 		{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
-	})
+	}, `W/"old"`)
 
-	sched := &refreshScheduler{
-		refreshHour:   0,
-		refreshMinute: 0,
-		fetcher:       f,
-		store:         store,
-		logger:        logger,
-		done:          make(chan struct{}),
-	}
+	testScheduler(t, server.URL, store).doRefresh()
 
-	// Manually trigger refresh
-	sched.doRefresh()
-
-	// API was called
 	if requestCount.Load() == 0 {
 		t.Fatal("expected API to be called")
 	}
 
-	// Existing data preserved after failure
 	rec := store.Lookup(netip.MustParseAddr("10.1.2.3"))
 	if rec == nil || rec.Country != "US" {
 		t.Errorf("expected existing data preserved, got %+v", rec)
@@ -129,186 +112,145 @@ func TestSchedulerRefreshOnAPIFailure(t *testing.T) {
 }
 
 func TestSchedulerRefreshOnAPITimeout(t *testing.T) {
-	// API that hangs forever
+	// API that hangs without ever sending headers.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
-			return
 		case <-time.After(30 * time.Second):
-			return
 		}
 	}))
 	defer server.Close()
 
 	logger, _ := zap.NewDevelopment()
 	store := newDataStore(t.TempDir() + "/test.gob")
-	f := &fetcher{
-		apiURL: server.URL,
-		logger: logger,
-		client: &http.Client{Timeout: 100 * time.Millisecond}, // very short timeout
-	}
-
 	store.Replace([]cidrEntry{
 		{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
-	})
+	}, `W/"old"`)
 
-	sched := &refreshScheduler{
-		refreshHour:   0,
-		refreshMinute: 0,
-		fetcher:       f,
-		store:         store,
-		logger:        logger,
-		done:          make(chan struct{}),
+	sched, err := newScheduler("03:00", newFetcher(server.URL, nil, nil, logger), store, logger)
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer sched.Stop()
 
+	// Bound the wait: refreshTimeout is 10 minutes, which is right in
+	// production and far too long for a test. Cancelling the scheduler's own
+	// context is what a Caddy shutdown does, and doRefresh derives from it.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		sched.cancel()
+	}()
 	sched.doRefresh()
 
-	// Data still intact
 	rec := store.Lookup(netip.MustParseAddr("10.1.2.3"))
 	if rec == nil || rec.Country != "US" {
 		t.Errorf("expected data preserved after timeout, got %+v", rec)
 	}
 }
 
-func TestSchedulerRefreshOnPartialData(t *testing.T) {
-	var callCount atomic.Int32
-
-	// API that returns data on first page but fails on second
+// A stream that dies partway through must leave the previous dataset in place.
+// This is the streaming counterpart of the old mid-pagination failure case: the
+// lines that did arrive are valid JSON, so only the missing terminator marks
+// the download as unusable.
+func TestSchedulerRefreshOnTruncatedStream(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := callCount.Add(1)
-		if count == 1 {
-			json.NewEncoder(w).Encode(apiResponse{
-				Data: []orgRecord{
-					{
-						OrgName:  "Test",
-						OrgID:    "TST",
-						ASNs:     []asnInfo{{ASN: 1, ASNName: "T", Registry: "arin", Country: "US"}},
-						IPRanges: ipRanges{IPv4: []ipRange{{StartIP: "10.0.0.0/8", Country: "US", Registry: "arin"}}},
-					},
-				},
-				Total: 2000, // claims there are more
-			})
-		} else {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
+		fmt.Fprint(w, `{"s":"10.0.0.0","e":"10.255.255.255","c":"US","r":"arin","oid":"A","on":"A"}`+"\n")
 	}))
 	defer server.Close()
 
-	logger, _ := zap.NewDevelopment()
 	store := newDataStore(t.TempDir() + "/test.gob")
-	f := newFetcher(server.URL, logger)
-
-	// Pre-load different data
 	store.Replace([]cidrEntry{
 		{PrefixStr: "192.168.0.0/16", Record: geoRecord{Country: "DE"}},
-	})
+	}, `W/"old"`)
 
-	sched := &refreshScheduler{
-		refreshHour:   0,
-		refreshMinute: 0,
-		fetcher:       f,
-		store:         store,
-		logger:        logger,
-		done:          make(chan struct{}),
-	}
+	testScheduler(t, server.URL, store).doRefresh()
 
-	sched.doRefresh()
-
-	// Old data should be preserved since fetch failed mid-way
 	rec := store.Lookup(netip.MustParseAddr("192.168.1.1"))
 	if rec == nil || rec.Country != "DE" {
-		t.Errorf("expected old data preserved after partial failure, got %+v", rec)
+		t.Errorf("expected old data preserved after truncated stream, got %+v", rec)
 	}
 }
 
 func TestSchedulerRefreshSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(apiResponse{
-			Data: []orgRecord{
-				{
-					OrgName:  "NewOrg",
-					OrgID:    "NEW",
-					ASNs:     []asnInfo{{ASN: 999, ASNName: "NEWASN", Registry: "ripencc", Country: "FR"}},
-					IPRanges: ipRanges{IPv4: []ipRange{{StartIP: "172.16.0.0/12", Country: "FR", Registry: "ripencc"}}},
-				},
-			},
-			Total: 1,
-		})
+		w.Header().Set("ETag", `W/"geo-new"`)
+		fmt.Fprint(w, exportBody(
+			`{"s":"172.16.0.0","e":"172.31.255.255","c":"FR","r":"ripencc","oid":"NEW","on":"NewOrg"}`,
+		))
 	}))
 	defer server.Close()
 
-	logger, _ := zap.NewDevelopment()
-	dir := t.TempDir()
-	store := newDataStore(dir + "/test.gob")
-	f := newFetcher(server.URL, logger)
-
-	// Old data
+	store := newDataStore(t.TempDir() + "/test.gob")
 	store.Replace([]cidrEntry{
 		{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
-	})
+	}, `W/"old"`)
 
-	sched := &refreshScheduler{
-		refreshHour:   0,
-		refreshMinute: 0,
-		fetcher:       f,
-		store:         store,
-		logger:        logger,
-		done:          make(chan struct{}),
-	}
+	testScheduler(t, server.URL, store).doRefresh()
 
-	sched.doRefresh()
-
-	// New data should be active
 	rec := store.Lookup(netip.MustParseAddr("172.16.5.5"))
 	if rec == nil || rec.Country != "FR" {
 		t.Errorf("expected new data after successful refresh, got %+v", rec)
 	}
 
-	// Old data gone
-	rec = store.Lookup(netip.MustParseAddr("10.1.2.3"))
-	if rec != nil {
+	if rec := store.Lookup(netip.MustParseAddr("10.1.2.3")); rec != nil {
 		t.Errorf("expected old data removed after refresh, got %+v", rec)
+	}
+
+	if store.ETag() != `W/"geo-new"` {
+		t.Errorf("expected the new ETag to be stored, got %q", store.ETag())
 	}
 }
 
-func TestFetcherContextCancelMidPagination(t *testing.T) {
-	var callCount atomic.Int32
-	cancelAfter := int32(3) // cancel after 3rd request
-
-	ctx, cancel := context.WithCancel(context.Background())
+// A 304 must leave the dataset and its ETag untouched rather than clearing them.
+func TestSchedulerRefreshNotModified(t *testing.T) {
+	var served atomic.Int32
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := callCount.Add(1)
-		if count >= cancelAfter {
-			cancel() // cancel context during this request
+		served.Add(1)
+		if r.Header.Get("If-None-Match") == `W/"geo-current"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
 		}
-		json.NewEncoder(w).Encode(apiResponse{
-			Data: []orgRecord{
-				{
-					OrgName:  "Org",
-					OrgID:    "O",
-					IPRanges: ipRanges{IPv4: []ipRange{{StartIP: "10.0.0.0/8", Country: "US"}}},
-				},
-			},
-			Total: 100000, // pretend there are many pages
-		})
+		fmt.Fprint(w, exportBody())
+	}))
+	defer server.Close()
+
+	store := newDataStore(t.TempDir() + "/test.gob")
+	store.Replace([]cidrEntry{
+		{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
+	}, `W/"geo-current"`)
+
+	testScheduler(t, server.URL, store).doRefresh()
+
+	if served.Load() != 1 {
+		t.Fatalf("expected exactly one request, got %d", served.Load())
+	}
+	rec := store.Lookup(netip.MustParseAddr("10.1.2.3"))
+	if rec == nil || rec.Country != "US" {
+		t.Errorf("expected data kept on 304, got %+v", rec)
+	}
+	if store.ETag() != `W/"geo-current"` {
+		t.Errorf("expected ETag kept on 304, got %q", store.ETag())
+	}
+}
+
+func TestFetcherContextCancelMidStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Sends one line, then blocks so the body is still open when the context is
+	// cancelled.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"s":"10.0.0.0","e":"10.255.255.255","c":"US","r":"arin","oid":"A","on":"A"}`+"\n")
+		w.(http.Flusher).Flush()
+		cancel()
+		<-r.Context().Done()
 	}))
 	defer server.Close()
 
 	logger, _ := zap.NewDevelopment()
-	f := newFetcher(server.URL, logger)
+	f := newFetcher(server.URL, nil, nil, logger)
 
-	_, err := f.FetchAll(ctx)
-	if err == nil {
+	if _, err := f.FetchAll(ctx, ""); err == nil {
 		t.Fatal("expected error on context cancellation")
-	}
-
-	// Should have made some requests but not all 100 pages
-	count := callCount.Load()
-	if count == 0 {
-		t.Fatal("expected at least 1 request")
-	}
-	if count >= 100 {
-		t.Errorf("expected cancellation to stop pagination early, got %d requests", count)
 	}
 }

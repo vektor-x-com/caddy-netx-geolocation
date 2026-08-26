@@ -1,14 +1,12 @@
 package caddy_netx_geolocation
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"net/netip"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -31,7 +29,23 @@ type NetxGeolocation struct {
 	DataDir string `json:"data_dir,omitempty"`
 
 	// Daily refresh time in HH:MM local time (default: 03:00)
+	//
+	// The upstream dataset is rebuilt at 04:00 UTC, so a refresh scheduled
+	// before that consistently downloads the previous day's snapshot. Pick a
+	// time that lands after 04:00 UTC in the server's local zone.
 	RefreshTime string `json:"refresh_time,omitempty"`
+
+	// DownloadCountries and DownloadRegistries narrow what is downloaded, as
+	// opposed to the Allow/Deny fields below which filter requests against a
+	// dataset already in memory.
+	//
+	// These trade coverage for size: an address outside the downloaded slice
+	// resolves to no record at all, so its placeholders read "-" and it is
+	// treated exactly like an address the dataset has never heard of. Set them
+	// only when that is the intended behaviour — for a deny-list deployment it
+	// is usually not, since unknown addresses pass a deny-list.
+	DownloadCountries  []string `json:"download_countries,omitempty"`
+	DownloadRegistries []string `json:"download_registries,omitempty"`
 
 	// Matcher fields
 	AllowCountries  []string `json:"allow_countries,omitempty"`
@@ -77,33 +91,15 @@ func (n *NetxGeolocation) Provision(ctx caddy.Context) error {
 	dataFile := filepath.Join(dataDir, "netx_geo_data.gob")
 
 	// Initialize components
-	n.fetcher = newFetcher(apiURL, n.logger)
+	n.fetcher = newFetcher(apiURL, n.DownloadCountries, n.DownloadRegistries, n.logger)
 	n.store = newDataStore(dataFile)
 
-	// Try loading from local file first
-	if err := n.store.LoadFromFile(); err != nil {
+	loadErr := n.store.LoadFromFile()
+	if loadErr != nil {
 		n.logger.Warn("could not load local data file, will fetch from API",
 			zap.String("file", dataFile),
-			zap.Error(err),
+			zap.Error(loadErr),
 		)
-
-		// Synchronous fetch on first start
-		fetchCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancel()
-
-		entries, err := n.fetcher.FetchAll(fetchCtx)
-		if err != nil {
-			n.logger.Error("initial fetch failed, starting with empty data", zap.Error(err))
-		} else {
-			loaded, skipped := n.store.Replace(entries)
-			n.logger.Info("initial data loaded",
-				zap.Int("loaded", loaded),
-				zap.Int("skipped", skipped),
-			)
-			if err := n.store.SaveToFile(); err != nil {
-				n.logger.Error("failed to save initial data file", zap.Error(err))
-			}
-		}
 	} else {
 		n.logger.Info("loaded data from local file",
 			zap.String("file", dataFile),
@@ -119,6 +115,23 @@ func (n *NetxGeolocation) Provision(ctx caddy.Context) error {
 	n.scheduler = sched
 	n.scheduler.Start()
 
+	// Populate in the background when there was no local file to start from.
+	//
+	// Provisioning must not block on this. Caddy loads a new config before
+	// releasing the previous one's listeners, so a Provision that waits on a
+	// network download holds the whole reload open for its duration — the
+	// symptom was "bind: address already in use" after the handler spent
+	// minutes here across two provision passes. Serving with an empty dataset
+	// for a few seconds is the better failure mode: every lookup misses,
+	// placeholders read "-", and a deny-list configuration keeps passing
+	// traffic rather than the config failing to load at all.
+	//
+	// Note this is a real difference for allow-list configurations, which
+	// reject unknown addresses: those return 403 until the first fetch lands.
+	if loadErr != nil {
+		n.scheduler.RefreshNow()
+	}
+
 	return nil
 }
 
@@ -132,6 +145,22 @@ func (n *NetxGeolocation) Validate() error {
 	for _, c := range n.DenyCountries {
 		if len(c) != 2 {
 			return fmt.Errorf("invalid country code %q: must be 2-letter ISO code", c)
+		}
+	}
+	// Validated here rather than left to the API: these go into the export
+	// query string, and a typo would otherwise surface as a 400 inside a
+	// background refresh — logged, but with the module already loaded and
+	// serving an empty dataset.
+	for _, c := range n.DownloadCountries {
+		if len(c) != 2 {
+			return fmt.Errorf("invalid download_countries value %q: must be 2-letter ISO code", c)
+		}
+	}
+	for _, r := range n.DownloadRegistries {
+		switch strings.ToLower(r) {
+		case "arin", "ripencc", "apnic", "lacnic", "afrinic":
+		default:
+			return fmt.Errorf("invalid download_registries value %q: allowed are arin, ripencc, apnic, lacnic, afrinic", r)
 		}
 	}
 	if n.RefreshTime != "" {
@@ -209,6 +238,10 @@ func (n *NetxGeolocation) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			n.RefreshTime = d.Val()
+		case "download_countries":
+			n.DownloadCountries = append(n.DownloadCountries, d.RemainingArgs()...)
+		case "download_registries":
+			n.DownloadRegistries = append(n.DownloadRegistries, d.RemainingArgs()...)
 		case "allow_countries":
 			n.AllowCountries = append(n.AllowCountries, d.RemainingArgs()...)
 		case "deny_countries":

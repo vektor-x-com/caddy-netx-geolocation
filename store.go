@@ -10,14 +10,27 @@ import (
 	"sync"
 )
 
-const storeVersion byte = 1
+// storeVersion is 2 because the on-disk payload gained the export ETag. A
+// version-1 file decodes as a bare []cidrEntry and has no ETag to condition on;
+// LoadFromFile rejects it, which costs one full re-download on upgrade and then
+// never again. That is cheaper than the alternative of guessing.
+const storeVersion byte = 2
 
 // dataStore manages the in-memory IP trie and its persistence to disk.
 type dataStore struct {
 	mu       sync.RWMutex
 	trie     *ipTrie
 	entries  []cidrEntry
+	etag     string
 	filePath string
+}
+
+// persistedStore is the gob payload. Named fields rather than a bare slice so
+// later additions do not need another version bump — gob tolerates unknown and
+// missing fields within a struct.
+type persistedStore struct {
+	ETag    string
+	Entries []cidrEntry
 }
 
 // cidrEntry is a flat record for persistence and trie building.
@@ -44,8 +57,14 @@ func (ds *dataStore) Lookup(ip netip.Addr) *geoRecord {
 	return ds.trie.Lookup(ip)
 }
 
-// Replace rebuilds the trie from new entries under a write lock.
-func (ds *dataStore) Replace(entries []cidrEntry) (int, int) {
+// Replace rebuilds the trie from new entries under a write lock. etag is the
+// export snapshot the entries came from and is stored alongside them.
+//
+// The trie is built before the lock is taken so lookups keep serving the
+// previous dataset for the duration — with ~465k prefixes the build is not
+// instant, and a geolocation handler blocking on it would stall request
+// handling rather than briefly return stale-but-valid answers.
+func (ds *dataStore) Replace(entries []cidrEntry, etag string) (int, int) {
 	newTrie := newIPTrie()
 	loaded := 0
 	skipped := 0
@@ -63,9 +82,18 @@ func (ds *dataStore) Replace(entries []cidrEntry) (int, int) {
 	ds.mu.Lock()
 	ds.trie = newTrie
 	ds.entries = entries
+	ds.etag = etag
 	ds.mu.Unlock()
 
 	return loaded, skipped
+}
+
+// ETag returns the export snapshot identifier of the loaded data, or empty if
+// none is known. Sent as If-None-Match on the next fetch.
+func (ds *dataStore) ETag() string {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	return ds.etag
 }
 
 // EntryCount returns the number of entries currently loaded.
@@ -78,10 +106,10 @@ func (ds *dataStore) EntryCount() int {
 // SaveToFile persists the current entries to the gob file.
 func (ds *dataStore) SaveToFile() error {
 	ds.mu.RLock()
-	entries := ds.entries
+	payload := persistedStore{ETag: ds.etag, Entries: ds.entries}
 	ds.mu.RUnlock()
 
-	if len(entries) == 0 {
+	if len(payload.Entries) == 0 {
 		return nil
 	}
 
@@ -95,7 +123,7 @@ func (ds *dataStore) SaveToFile() error {
 	buf.WriteByte(storeVersion)
 
 	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(entries); err != nil {
+	if err := enc.Encode(payload); err != nil {
 		return fmt.Errorf("encoding entries: %w", err)
 	}
 
@@ -128,12 +156,12 @@ func (ds *dataStore) LoadFromFile() error {
 		return fmt.Errorf("unsupported data file version: %d", version)
 	}
 
-	var entries []cidrEntry
+	var payload persistedStore
 	dec := gob.NewDecoder(bytes.NewReader(data[1:]))
-	if err := dec.Decode(&entries); err != nil {
+	if err := dec.Decode(&payload); err != nil {
 		return fmt.Errorf("decoding entries: %w", err)
 	}
 
-	ds.Replace(entries)
+	ds.Replace(payload.Entries, payload.ETag)
 	return nil
 }

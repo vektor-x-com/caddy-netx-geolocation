@@ -47,7 +47,15 @@ example.com {
         data_dir /var/lib/caddy/netx
 
         # Daily refresh time in HH:MM local time (optional, default: 03:00)
-        refresh_time 03:00
+        # The upstream dataset rebuilds at 04:00 UTC — pick a time after that
+        # in your server's local zone, or you always get yesterday's snapshot.
+        refresh_time 05:00
+
+        # Download only part of the dataset (optional, default: everything).
+        # Addresses outside the downloaded slice resolve as unknown ("-"),
+        # so this is only safe when that is what you want.
+        # download_countries DE FR NL
+        # download_registries ripencc
 
         # Block/allow by country (2-letter ISO code)
         deny_countries RU CN
@@ -73,6 +81,8 @@ example.com {
 | `api_url` | NET-X API base URL | `https://net.vektor-x.com` |
 | `data_dir` | Directory for the local data file | Caddy AppDataDir |
 | `refresh_time` | Daily refresh time (HH:MM, local time) | `03:00` |
+| `download_countries` | Download only ranges in these countries | (all countries) |
+| `download_registries` | Download only ranges from these registries | (all registries) |
 | `allow_countries` | Only allow these country codes | (allow all) |
 | `deny_countries` | Block these country codes | (deny none) |
 | `allow_orgs` | Only allow these organization names | (allow all) |
@@ -81,6 +91,25 @@ example.com {
 | `deny_registries` | Block these registries | (deny none) |
 
 Deny rules take precedence over allow rules.
+
+`download_countries` / `download_registries` are not filters on requests — they
+narrow what gets downloaded. An address outside the downloaded slice looks
+identical to one the dataset has never heard of: its placeholders read `-`, so a
+deny-list still passes it and an allow-list still blocks it. Use them to shrink
+the dataset when you only care about a few regions, not as a blocking mechanism.
+
+### Startup behaviour
+
+The dataset is fetched in the background, so Caddy starts serving immediately
+rather than blocking on the download. If there is no local data file yet, the
+first requests are answered with an empty dataset — every lookup misses and
+placeholders read `-` — until the initial fetch lands. That matters for
+allow-list configurations, which reject unknown addresses and will therefore
+return 403 for a few seconds on a cold start.
+
+Subsequent daily refreshes send the previous snapshot's `ETag`; when the
+upstream data has not changed, the server answers `304` and nothing is
+re-downloaded.
 
 ### Placeholders
 
