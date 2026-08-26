@@ -16,7 +16,7 @@ func TestStoreReplaceAndLookup(t *testing.T) {
 		{PrefixStr: "192.168.0.0/16", Record: geoRecord{Country: "DE"}},
 	}
 
-	loaded, skipped := ds.Replace(entries)
+	loaded, skipped := ds.Replace(entries, "")
 	if loaded != 2 || skipped != 0 {
 		t.Fatalf("expected loaded=2 skipped=0, got loaded=%d skipped=%d", loaded, skipped)
 	}
@@ -47,7 +47,7 @@ func TestStoreReplaceSkipsMalformedCIDR(t *testing.T) {
 		{PrefixStr: "172.16.0.0/12", Record: geoRecord{Country: "DE"}},
 	}
 
-	loaded, skipped := ds.Replace(entries)
+	loaded, skipped := ds.Replace(entries, "")
 	if loaded != 2 {
 		t.Errorf("expected 2 loaded, got %d", loaded)
 	}
@@ -66,7 +66,7 @@ func TestStoreSaveAndLoad(t *testing.T) {
 		{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US", OrgName: "TestOrg"}},
 		{PrefixStr: "2001:db8::/32", Record: geoRecord{Country: "JP"}},
 	}
-	ds1.Replace(entries)
+	ds1.Replace(entries, `W/"test-etag"`)
 	if err := ds1.SaveToFile(); err != nil {
 		t.Fatalf("SaveToFile failed: %v", err)
 	}
@@ -89,6 +89,12 @@ func TestStoreSaveAndLoad(t *testing.T) {
 	rec = ds2.Lookup(netip.MustParseAddr("2001:db8::1"))
 	if rec == nil || rec.Country != "JP" {
 		t.Errorf("IPv6 lookup after load failed: %+v", rec)
+	}
+
+	// The ETag has to survive a restart or the first refresh after one
+	// re-downloads the whole export instead of getting a 304.
+	if ds2.ETag() != `W/"test-etag"` {
+		t.Errorf("expected the ETag to round-trip through the file, got %q", ds2.ETag())
 	}
 }
 
@@ -166,7 +172,7 @@ func TestStoreSaveToReadOnlyDir(t *testing.T) {
 	ds := newDataStore(filePath)
 	ds.Replace([]cidrEntry{
 		{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
-	})
+	}, "")
 
 	err := ds.SaveToFile()
 	if err == nil {
@@ -182,7 +188,7 @@ func TestStoreConcurrentLookupDuringReplace(t *testing.T) {
 	// Initial data
 	ds.Replace([]cidrEntry{
 		{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
-	})
+	}, "")
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -215,10 +221,10 @@ func TestStoreConcurrentLookupDuringReplace(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			ds.Replace([]cidrEntry{
 				{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "DE"}},
-			})
+			}, "")
 			ds.Replace([]cidrEntry{
 				{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
-			})
+			}, "")
 		}
 		close(stop)
 	}()
@@ -234,7 +240,7 @@ func TestStoreConcurrentSaveAndLoad(t *testing.T) {
 	ds.Replace([]cidrEntry{
 		{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
 		{PrefixStr: "172.16.0.0/12", Record: geoRecord{Country: "DE"}},
-	})
+	}, "")
 
 	var wg sync.WaitGroup
 
