@@ -2,6 +2,7 @@ package caddy_netx_geolocation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -130,6 +131,16 @@ func (rs *refreshScheduler) doRefresh() {
 
 	result, err := rs.fetcher.FetchAll(ctx, rs.store.ETag())
 	if err != nil {
+		// A refresh cancelled by Stop is a shutdown or config reload, not a
+		// failure. Reporting it at ERROR made every reload during the initial
+		// fetch print "refresh failed" alongside whatever actually went wrong,
+		// which buried the real error. rs.ctx distinguishes the two: it is
+		// cancelled only by Stop, whereas a timeout inside the refresh leaves
+		// it live and is still worth an ERROR.
+		if errors.Is(err, context.Canceled) && rs.ctx.Err() != nil {
+			rs.logger.Info("refresh cancelled during shutdown")
+			return
+		}
 		rs.logger.Error("refresh failed, keeping existing data",
 			zap.Error(err),
 			zap.Int("current_entries", rs.store.EntryCount()),

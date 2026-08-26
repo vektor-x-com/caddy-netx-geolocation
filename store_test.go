@@ -272,3 +272,58 @@ func TestStoreConcurrentSaveAndLoad(t *testing.T) {
 		t.Fatalf("file corrupted after concurrent saves: %v", err)
 	}
 }
+
+// Two dataStores pointed at the same file must not break each other. Caddy
+// provisions a handler once per place it appears in a config, so two instances
+// sharing a data_dir is a normal deployment, and they previously collided on a
+// single fixed "<file>.tmp": both wrote it, the first rename consumed it, and
+// the second failed with "renaming temp file: ... no such file or directory".
+func TestStoreConcurrentSaversShareDirectory(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "shared.gob")
+
+	const savers = 8
+	stores := make([]*dataStore, savers)
+	for i := range stores {
+		stores[i] = newDataStore(filePath)
+		stores[i].Replace([]cidrEntry{
+			{PrefixStr: "10.0.0.0/8", Record: geoRecord{Country: "US"}},
+			{PrefixStr: "192.168.0.0/16", Record: geoRecord{Country: "DE"}},
+		}, `W/"shared"`)
+	}
+
+	errs := make(chan error, savers)
+	var wg sync.WaitGroup
+	for _, ds := range stores {
+		wg.Add(1)
+		go func(ds *dataStore) {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				if err := ds.SaveToFile(); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(ds)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Errorf("concurrent SaveToFile failed: %v", err)
+	}
+
+	// Whoever landed last must have left a complete, loadable file.
+	reloaded := newDataStore(filePath)
+	if err := reloaded.LoadFromFile(); err != nil {
+		t.Fatalf("file left unreadable after concurrent saves: %v", err)
+	}
+	if reloaded.EntryCount() != 2 {
+		t.Errorf("expected 2 entries, got %d", reloaded.EntryCount())
+	}
+
+	// No temp files may survive a clean run.
+	leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(filePath), "*.tmp"))
+	if len(leftovers) != 0 {
+		t.Errorf("temp files left behind: %v", leftovers)
+	}
+}
