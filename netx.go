@@ -55,10 +55,16 @@ type NetxGeolocation struct {
 	AllowRegistries []string `json:"allow_registries,omitempty"`
 	DenyRegistries  []string `json:"deny_registries,omitempty"`
 
-	logger    *zap.Logger
-	store     *dataStore
-	scheduler *refreshScheduler
-	fetcher   *fetcher
+	logger  *zap.Logger
+	fetcher *fetcher
+
+	// store is the shared dataset's trie, held directly so ServeHTTP does not
+	// hop through shared on every request.
+	store *dataStore
+	// shared is reference-counted in geoPool and released by Cleanup; key
+	// identifies it there.
+	shared *sharedDataset
+	key    datasetKey
 }
 
 // CaddyModule returns the Caddy module information.
@@ -90,47 +96,17 @@ func (n *NetxGeolocation) Provision(ctx caddy.Context) error {
 	}
 	dataFile := filepath.Join(dataDir, "netx_geo_data.gob")
 
-	// Initialize components
+	// Initialize components. The fetcher is per-instance and cheap; the
+	// dataset behind it is not, so it is shared — see shared.go.
 	n.fetcher = newFetcher(apiURL, n.DownloadCountries, n.DownloadRegistries, n.logger)
-	n.store = newDataStore(dataFile)
 
-	loadErr := n.store.LoadFromFile()
-	if loadErr != nil {
-		n.logger.Warn("could not load local data file, will fetch from API",
-			zap.String("file", dataFile),
-			zap.Error(loadErr),
-		)
-	} else {
-		n.logger.Info("loaded data from local file",
-			zap.String("file", dataFile),
-			zap.Int("entries", n.store.EntryCount()),
-		)
-	}
-
-	// Start daily refresh scheduler
-	sched, err := newScheduler(refreshTime, n.fetcher, n.store, n.logger)
+	n.key = newDatasetKey(apiURL, dataFile, refreshTime, n.DownloadCountries, n.DownloadRegistries)
+	ds, err := loadDataset(n.key, n.fetcher, n.logger)
 	if err != nil {
 		return err
 	}
-	n.scheduler = sched
-	n.scheduler.Start()
-
-	// Populate in the background when there was no local file to start from.
-	//
-	// Provisioning must not block on this. Caddy loads a new config before
-	// releasing the previous one's listeners, so a Provision that waits on a
-	// network download holds the whole reload open for its duration — the
-	// symptom was "bind: address already in use" after the handler spent
-	// minutes here across two provision passes. Serving with an empty dataset
-	// for a few seconds is the better failure mode: every lookup misses,
-	// placeholders read "-", and a deny-list configuration keeps passing
-	// traffic rather than the config failing to load at all.
-	//
-	// Note this is a real difference for allow-list configurations, which
-	// reject unknown addresses: those return 403 until the first fetch lands.
-	if loadErr != nil {
-		n.scheduler.RefreshNow()
-	}
+	n.shared = ds
+	n.store = ds.store
 
 	return nil
 }
@@ -209,12 +185,15 @@ func (n *NetxGeolocation) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 	return next.ServeHTTP(w, r)
 }
 
-// Cleanup stops the scheduler.
+// Cleanup releases this handler's reference to the shared dataset. The
+// dataset — and the refresh loop that maintains it — is torn down only when
+// the last handler using it goes away, which for a multi-site config is the
+// final one to be cleaned up rather than the first.
 func (n *NetxGeolocation) Cleanup() error {
-	if n.scheduler != nil {
-		n.scheduler.Stop()
+	if n.shared == nil {
+		return nil
 	}
-	return nil
+	return releaseDataset(n.key)
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
