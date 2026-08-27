@@ -78,11 +78,16 @@ func TestAgainstRealExport(t *testing.T) {
 		t.Errorf("entry accounting is inconsistent: %d entries, %d loaded", len(res.Entries), loaded)
 	}
 
-	// Spot-check addresses whose attribution is independently known: 1.0.0.0/24
-	// is APNIC's research block and 8.8.8.8 is Google.
-	for _, tc := range []struct{ ip, wantCountry string }{
-		{"1.0.0.1", "AU"},
-		{"8.8.8.8", "US"},
+	// Spot-check addresses whose attribution is independently known.
+	//
+	// 1.0.0.1 is the case worth keeping: APNIC holds the allocation, but
+	// Cloudflare announces it for the public resolver, so it reads US/Cloudflare
+	// and not AU/APNIC. It asserted AU until the API began exporting announced
+	// routes alongside allocations, and the change of answer is the point — the
+	// export now resolves the way /api/data?ip= does.
+	for _, tc := range []struct{ ip, wantCountry, wantOrg string }{
+		{"1.0.0.1", "US", "Cloudflare, Inc."},
+		{"8.8.8.8", "US", "Google LLC"},
 	} {
 		rec := store.Lookup(netip.MustParseAddr(tc.ip))
 		if rec == nil {
@@ -92,6 +97,9 @@ func TestAgainstRealExport(t *testing.T) {
 		t.Logf("%s -> country=%s registry=%s org=%q", tc.ip, rec.Country, rec.Registry, rec.OrgName)
 		if rec.Country != tc.wantCountry {
 			t.Errorf("%s: expected country %s, got %s", tc.ip, tc.wantCountry, rec.Country)
+		}
+		if rec.OrgName != tc.wantOrg {
+			t.Errorf("%s: expected org %q, got %q", tc.ip, tc.wantOrg, rec.OrgName)
 		}
 	}
 
